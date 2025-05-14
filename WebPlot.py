@@ -1,132 +1,71 @@
-import pandas as pd
-import plotly.express as px
 import streamlit as st
+import pandas as pd
+from io import BytesIO
+import re
 
-# Function to preprocess data
-def preprocess_data(df, x_col, y_col):
-    if x_col:
-        if 'Date' in x_col:
-            df[x_col] = pd.to_datetime(df[x_col], errors='coerce')  # Convert to datetime
-        else:
-            df[x_col] = df[x_col].astype(str).replace('[^-?\d.]', '', regex=True)  # Retain negative sign and numeric characters
-            df[x_col] = pd.to_numeric(df[x_col], errors='coerce')  # Convert to numeric, forcing errors to NaN
-    
-    df[y_col] = df[y_col].astype(str).replace('[^-?\d.]', '', regex=True)  # Retain negative sign and numeric characters
-    df[y_col] = pd.to_numeric(df[y_col], errors='coerce')  # Convert to numeric, forcing errors to NaN
+st.title("📊 多Sheet按SN保留最新记录并汇总（支持变动列名）")
 
-    return df
+uploaded_file = st.file_uploader("请上传包含多个Sheet的Excel文件", type=["xlsx"])
 
-# Function to calculate CPK
-def calculate_cpk(mean, std, upper_limit, lower_limit):
-    if upper_limit is not None and lower_limit is not None:
-        if upper_limit > mean and lower_limit < mean:
-            return min((upper_limit - mean) / (3 * std), (mean - lower_limit) / (3 * std))
+# 智能识别 SN 列名
+def find_sn_column(columns):
+    for col in columns:
+        col_clean = col.strip().lower().replace(" ", "")
+        if col_clean in ["sn", "serialnumber", "sfc"]:
+            return col
     return None
 
-# Function to create scatter plot
-def create_scatter_plot(df, x_col, y_col, title, subtitle, x_min, x_max, y_min, y_max, y_upper_limit, y_lower_limit):
-    if x_col == "None":
-        fig = px.scatter(df, y=y_col, title=title, color_discrete_sequence=['blue'])
-    else:
-        fig = px.scatter(df, x=x_col, y=y_col, title=title, color_discrete_sequence=['blue'])
+if uploaded_file:
+    all_sheets = pd.read_excel(uploaded_file, sheet_name=None)
+    sn_dfs = []
 
-    fig.update_traces(marker=dict(size=8), selector=dict(mode='markers'))
-    fig.update_layout(
-        title={
-            'text': title,
-            'x': 0.5,  # Center the title
-            'xanchor': 'center',
-            'yanchor': 'top'
-        },
-        xaxis_title=x_col if x_col != 'None' else None,
-        yaxis_title=y_col,
-        xaxis=dict(range=[x_min, x_max] if x_col != "None" and (x_min is not None or x_max is not None) else None),
-        yaxis=dict(range=[y_min, y_max] if y_min is not None and y_max is not None else None),
-        annotations=[
-            dict(
-                x=0.5,
-                y=0.1,  # Adjusted to avoid overlap with the plot
-                xref='paper',
-                yref='paper',
-                text=subtitle,
-                showarrow=False,
-                font=dict(size=10, color="gray"),  # Reduced font size for the subtitle
-                xanchor='center',
-                yanchor='top'
+    for sheet_name, df in all_sheets.items():
+        st.write(f"📄 正在处理 Sheet：**{sheet_name}**")
+
+        sn_col = find_sn_column(df.columns)
+        if sn_col and {'Date', 'Time'}.issubset(df.columns):
+            # 合并日期时间列
+            df['DateTime'] = pd.to_datetime(
+                df['Date'].astype(str) + ' ' + df['Time'].astype(str),
+                errors='coerce'
             )
-        ]
-    )
-    
-    # Draw horizontal lines if limits are provided
-    if y_upper_limit is not None:
-        fig.add_hline(y=y_upper_limit, line=dict(color="red", dash="dash"), annotation_text=f'Upper Limit = {y_upper_limit}')
+            df = df.dropna(subset=['DateTime'])
 
-    if y_lower_limit is not None:
-        fig.add_hline(y=y_lower_limit, line=dict(color="black", dash="dash"), annotation_text=f'Lower Limit = {y_lower_limit}')
+            # 标准化 SN 列名为 'SN'
+            df = df.rename(columns={sn_col: 'SN'})
 
-    return fig
+            # 按 SN 取最后一条记录
+            df_latest = df.sort_values('DateTime').groupby('SN', as_index=False).last()
 
-# Streamlit app
-def main():
-    st.title('散点图绘制应用')
+            # 给列加上 Sheet 前缀，SN 除外
+            df_latest = df_latest.rename(columns=lambda col: f"{sheet_name}_{col}" if col != 'SN' else col)
 
-    # File upload
-    uploaded_file = st.file_uploader("选择一个Excel文件", type="xlsx")
-    if uploaded_file:
-        xlsx = pd.ExcelFile(uploaded_file)
-        sheet_names = xlsx.sheet_names
-        sheet = st.selectbox("选择工作表", sheet_names)
-        df = pd.read_excel(uploaded_file, sheet_name=sheet)
-
-        # Select columns for X and Y axes
-        columns = df.columns.tolist()
-        x_col = st.selectbox("选择X轴列（可选）", ["None"] + columns)
-        y_col = st.selectbox("选择Y轴列", columns)
-
-        # Preprocess data
-        df = preprocess_data(df, x_col if x_col != "None" else None, y_col)
-
-        # Filter options
-        filter_col = st.selectbox("选择筛选列（可选）", ["None"] + columns)
-        if filter_col != "None":
-            filter_values = df[filter_col].dropna().unique()
-            selected_values = st.multiselect("选择筛选值", filter_values, default=filter_values.tolist())
-            df = df[df[filter_col].isin(selected_values)]
-
-        # X and Y axis limits
-        if x_col != "None" and pd.api.types.is_datetime64_any_dtype(df[x_col]):
-            x_min = st.date_input("X轴最小值", value=df[x_col].min().to_pydatetime())
-            x_max = st.date_input("X轴最大值", value=df[x_col].max().to_pydatetime())
+            sn_dfs.append(df_latest)
         else:
-            x_min = st.number_input("X轴最小值", value=float(df[x_col].min()) if x_col != "None" and not df[x_col].isnull().all() else None)
-            x_max = st.number_input("X轴最大值", value=float(df[x_col].max()) if x_col != "None" and not df[x_col].isnull().all() else None)
-        
-        y_min = st.number_input("Y轴最小值", value=float(df[y_col].min()) if not df[y_col].isnull().all() else None)
-        y_max = st.number_input("Y轴最大值", value=float(df[y_col].max()) if not df[y_col].isnull().all() else None)
+            st.warning(f"⚠️ Sheet「{sheet_name}」缺少 SN/Date/Time 列，或格式不正确，已跳过。")
 
-        # Input lines to draw
-        y_upper_limit = st.number_input("Y轴上限（Upper Limit）", value=None)
-        y_lower_limit = st.number_input("Y轴下限（Lower Limit）", value=None)
+    if sn_dfs:
+        # 合并所有 Sheet（横向合并）
+        from functools import reduce
+        merged_df = reduce(lambda left, right: pd.merge(left, right, on='SN', how='outer'), sn_dfs)
 
-        # Calculate statistics
-        sample_size = df[y_col].dropna().count()
-        mean_value = df[y_col].mean()
-        std_value = df[y_col].std()
+        st.success("✅ 处理完成！以下是结果预览：")
+        st.dataframe(merged_df.head(20))
 
-        # Calculate CPK
-        cpk = calculate_cpk(mean_value, std_value, y_upper_limit, y_lower_limit)
+        # 导出为 Excel
+        def convert_df_to_excel(df):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='SN汇总结果')
+            return output.getvalue()
 
-        # Generate custom title and subtitle
-        title = f"{x_col if x_col != 'None' else 'Index'} VS {y_col}"
-        subtitle = f"Sample Size: {sample_size}, Mean: {mean_value:.2f}, Std: {std_value:.2f}"
-        if cpk is not None:
-            subtitle += f", CPK: {cpk:.2f}"
+        excel_data = convert_df_to_excel(merged_df)
 
-        # Create scatter plot
-        fig = create_scatter_plot(df, x_col, y_col, title, subtitle, x_min, x_max, y_min, y_max, y_upper_limit, y_lower_limit)
-
-        # Show plot
-        st.plotly_chart(fig)
-
-if __name__ == "__main__":
-    main()
+        st.download_button(
+            label="📥 下载汇总结果 Excel",
+            data=excel_data,
+            file_name="SN汇总结果.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    else:
+        st.error("❌ 没有找到包含有效 SN/Date/Time 的 Sheet，未能生成汇总结果。")
